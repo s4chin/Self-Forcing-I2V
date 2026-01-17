@@ -6,7 +6,7 @@ import torch
 
 from pipeline import SelfForcingTrainingPipeline
 from utils.loss import get_denoising_loss
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper, WanCLIPEncoder, WanI2VDiffusionWrapper
 
 
 class BaseModel(nn.Module):
@@ -26,11 +26,20 @@ class BaseModel(nn.Module):
     def _initialize_models(self, args, device):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+        self.is_i2v = getattr(args, "i2v", False)
 
+        # Generator is always T2V causal model
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        # Real score: I2V model if i2v=True, else T2V
+        if self.is_i2v:
+            self.real_score = WanI2VDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+            self.clip_encoder = WanCLIPEncoder()
+            self.clip_encoder.requires_grad_(False)
+        else:
+            self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+            self.clip_encoder = None
         self.real_score.model.requires_grad_(False)
 
         self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)

@@ -309,3 +309,131 @@ class WanDiffusionWrapper(torch.nn.Module):
         We can gradually add more methods here if needed.
         """
         self.get_scheduler()
+
+
+class WanCLIPEncoder(torch.nn.Module):
+    """
+    CLIP visual encoder wrapper for I2V conditioning.
+    Outputs features from layer 31 (not final layer) for I2V model.
+    """
+    def __init__(
+        self,
+        checkpoint_path: str = "wan_models/Wan2.1-I2V-14B/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+        dtype: torch.dtype = torch.float16
+    ):
+        super().__init__()
+        from wan.modules.clip import CLIPModel
+        
+        self.dtype = dtype
+        self.clip = CLIPModel(
+            dtype=dtype,
+            device=torch.device('cpu'),  # Will be moved to GPU later via FSDP
+            checkpoint_path=checkpoint_path,
+        )
+        self.clip.model.eval().requires_grad_(False)
+
+    @property
+    def device(self):
+        return next(self.clip.model.parameters()).device
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        Encode images using CLIP visual encoder.
+        
+        Args:
+            images: [B, C, H, W] tensor of images normalized to [-1, 1]
+        
+        Returns:
+            clip_fea: CLIP visual features for I2V conditioning
+        """
+        # CLIPModel.visual expects list of videos with shape [C, T, H, W]
+        # For single image, we add a temporal dimension
+        # images: [B, C, H, W] -> [B, C, 1, H, W] -> list of [C, 1, H, W]
+        images = images.to(device=self.device, dtype=self.dtype)
+        videos = [img.unsqueeze(1) for img in images]  # List of [C, 1, H, W]
+        
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            clip_fea = self.clip.visual(videos)
+        
+        return clip_fea
+
+
+class WanI2VDiffusionWrapper(WanDiffusionWrapper):
+    """
+    I2V (Image-to-Video) diffusion model wrapper.
+    Extends WanDiffusionWrapper to handle I2V-specific conditioning:
+    - clip_fea: CLIP visual features
+    - y: mask concatenated with first frame VAE latent
+    """
+    
+    def __init__(
+        self,
+        model_name="Wan2.1-I2V-14B",
+        timestep_shift=8.0,
+        is_causal=False,
+        local_attn_size=-1,
+        sink_size=0
+    ):
+        # I2V models are always non-causal for score matching
+        super().__init__(
+            model_name=model_name,
+            timestep_shift=timestep_shift,
+            is_causal=is_causal,
+            local_attn_size=local_attn_size,
+            sink_size=sink_size
+        )
+
+    def forward(
+        self,
+        noisy_image_or_video: torch.Tensor,
+        conditional_dict: dict,
+        timestep: torch.Tensor,
+        kv_cache: Optional[List[dict]] = None,
+        crossattn_cache: Optional[List[dict]] = None,
+        current_start: Optional[int] = None,
+        classify_mode: Optional[bool] = False,
+        concat_time_embeddings: Optional[bool] = False,
+        clean_x: Optional[torch.Tensor] = None,
+        aug_t: Optional[torch.Tensor] = None,
+        cache_start: Optional[int] = None
+    ) -> torch.Tensor:
+        """
+        Forward pass for I2V model with additional clip_fea and y conditioning.
+        
+        Args:
+            noisy_image_or_video: [B, F, C, H, W] noisy input
+            conditional_dict: dict containing:
+                - prompt_embeds: text embeddings
+                - clip_fea: CLIP visual features (I2V specific)
+                - y: mask + first frame latent (I2V specific)
+            timestep: [B, F] timesteps
+        """
+        prompt_embeds = conditional_dict["prompt_embeds"]
+        clip_fea = conditional_dict.get("clip_fea", None)
+        y = conditional_dict.get("y", None)
+
+        # [B, F] -> [B]
+        if self.uniform_timestep:
+            input_timestep = timestep[:, 0]
+        else:
+            input_timestep = timestep
+
+        # I2V model call with clip_fea and y
+        # Following wan/image2video.py lines 305-306
+        print(f"Inside I2VDiffusionWrapper forward: {noisy_image_or_video.shape=}, {input_timestep.shape=}, {prompt_embeds.shape=}, {clip_fea.shape=}, {y.shape=}")
+        flow_pred = self.model(
+            [noisy_image_or_video.permute(0, 2, 1, 3, 4)],  # List of [C, F, H, W]
+            t=input_timestep,
+            context=[prompt_embeds],
+            clip_fea=clip_fea,
+            y=y,
+            seq_len=self.seq_len
+        )[0].permute(0, 2, 1, 3, 4)  # Back to [B, F, C, H, W]
+
+        pred_x0 = self._convert_flow_pred_to_x0(
+            flow_pred=flow_pred.flatten(0, 1),
+            xt=noisy_image_or_video.flatten(0, 1),
+            timestep=timestep.flatten(0, 1)
+        ).unflatten(0, flow_pred.shape[:2])
+
+        return flow_pred, pred_x0

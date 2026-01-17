@@ -500,7 +500,7 @@ def clip_xlm_roberta_vit_h_14(
 
 class CLIPModel:
 
-    def __init__(self, dtype, device, checkpoint_path, tokenizer_path):
+    def __init__(self, dtype, device, checkpoint_path, tokenizer_path = None):
         self.dtype = dtype
         self.device = device
         self.checkpoint_path = checkpoint_path
@@ -519,10 +519,13 @@ class CLIPModel:
             torch.load(checkpoint_path, map_location='cpu'))
 
         # init tokenizer
-        self.tokenizer = HuggingfaceTokenizer(
-            name=tokenizer_path,
-            seq_len=self.model.max_text_len - 2,
-            clean='whitespace')
+        if tokenizer_path is not None:
+            self.tokenizer = HuggingfaceTokenizer(
+                name=tokenizer_path,
+                    seq_len=self.model.max_text_len - 2,
+                    clean='whitespace')
+        else:
+            self.tokenizer = None
 
     def visual(self, videos):
         # preprocess

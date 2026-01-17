@@ -214,6 +214,65 @@ class TextImagePairDataset(Dataset):
         }
 
 
+class I2VDataset(Dataset):
+    """
+    Dataset for Image-to-Video training.
+    Returns text prompts and raw images (normalized to [-1, 1]).
+    
+    Currently returns dummy data as placeholder - actual data loading
+    will be implemented later.
+    """
+    def __init__(
+        self,
+        data_path: str,
+        image_size: tuple = (480, 832),  # H, W - matches 60x104 latent at 8x downsample
+        num_samples: int = 10000,
+    ):
+        """
+        Args:
+            data_path: Path to dataset (unused for dummy data)
+            image_size: Target image size (H, W)
+            num_samples: Number of dummy samples to generate
+        """
+        self.data_path = data_path
+        self.image_size = image_size
+        self.num_samples = num_samples
+        
+        # Dummy prompts for testing
+        self.dummy_prompts = [
+            "A beautiful sunset over the ocean with waves crashing on the shore.",
+            "A cat playing with a ball of yarn in a cozy living room.",
+            "A drone flying over a mountain landscape with snow-capped peaks.",
+            "A chef cooking in a professional kitchen with flames rising.",
+            "A dancer performing ballet on stage with dramatic lighting.",
+        ]
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        """
+        Returns:
+            dict: A dictionary containing:
+                - prompts: str - text prompt
+                - image: torch.Tensor - [C, H, W] normalized to [-1, 1]
+        """
+        # Generate dummy prompt (cycle through available prompts)
+        prompt = self.dummy_prompts[idx % len(self.dummy_prompts)]
+        
+        # Generate dummy image (random noise for now)
+        # In real implementation, this would load actual images
+        # Image is [C, H, W] normalized to [-1, 1]
+        image = torch.randn(3, self.image_size[0], self.image_size[1])
+        image = image.clamp(-1, 1)  # Clamp to valid range
+        
+        return {
+            "prompts": prompt,
+            "image": image,
+            "idx": idx
+        }
+
+
 def cycle(dl):
     while True:
         for data in dl:

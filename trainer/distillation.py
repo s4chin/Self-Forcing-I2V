@@ -1,8 +1,8 @@
 import gc
 import logging
 
-from utils.dataset import ShardingLMDBDataset, cycle
-from utils.dataset import TextDataset
+from utils.dataset import cycle, I2VDataset, TextDataset
+from einops import rearrange
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -99,7 +99,17 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        if not config.no_visualize or config.load_raw_video:
+        # FSDP wrap clip_encoder for I2V
+        if getattr(config, "i2v", False) and self.model.clip_encoder is not None:
+            self.model.clip_encoder = fsdp_wrap(
+                self.model.clip_encoder,
+                sharding_strategy=config.sharding_strategy,
+                mixed_precision=config.mixed_precision,
+                wrap_strategy=getattr(config, "clip_encoder_fsdp_wrap_strategy", "size")
+            )
+
+        # Load VAE for I2V (needed for encoding images) or visualization
+        if not config.no_visualize or config.load_raw_video or getattr(config, "i2v", False):
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -121,7 +131,7 @@ class Trainer:
 
         # Step 3: Initialize the dataloader
         if self.config.i2v:
-            dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+            dataset = I2VDataset(config.data_path)
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -214,13 +224,66 @@ class Trainer:
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
+        clean_latent = None
+        image_latent = None
+        conditional_dict_i2v = None
+        unconditional_dict_i2v = None
+
         if self.config.i2v:
-            clean_latent = None
-            image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
-                device=self.device, dtype=self.dtype)
-        else:
-            clean_latent = None
-            image_latent = None
+            # Get raw image from batch: [B, C, H, W] normalized to [-1, 1]
+            raw_image = batch["image"].to(device=self.device, dtype=self.dtype)
+
+            with torch.no_grad():
+                # VAE encode raw image to get image_latent
+                # image needs to be [B, C, T, H, W] for VAE
+                image_for_vae = rearrange(raw_image, "b c h w -> b c 1 h w")
+                image_latent = self.model.vae.encode_to_latent(image_for_vae)  # [B, 1, C, H, W]
+                print(f"{image_latent.shape=}")
+
+                # CLIP encode image to get clip_fea
+                clip_fea = self.model.clip_encoder(raw_image)
+                print(f"{clip_fea.shape=}")
+
+                # Create mask tensor for I2V conditioning
+                # Following wan/image2video.py lines 207-214
+                lat_h, lat_w = image_latent.shape[-2], image_latent.shape[-1]
+                batch_size = raw_image.shape[0]
+
+                # Mask: 1 for first frame, 0 for rest (81 frames total)
+                msk = torch.ones(batch_size, 81, lat_h, lat_w, device=self.device, dtype=self.dtype)
+                msk[:, 1:] = 0
+                # Reshape: repeat first frame 4 times, then rest
+                msk = torch.concat([
+                    torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),
+                    msk[:, 1:]
+                ], dim=1)
+                # Reshape to [B, 4, 21, lat_h, lat_w]
+                msk = msk.view(batch_size, msk.shape[1] // 4, 4, lat_h, lat_w)
+                msk = msk.transpose(1, 2)  # [B, 4, 21, lat_h, lat_w]
+
+                # Create y by concatenating mask and image latent
+                # image_latent is [B, 1, 16, lat_h, lat_w], need to expand to full video
+                # Following wan/image2video.py lines 237-246
+                # First, encode the image and add zeros for remaining frames
+                image_latent_expanded = image_latent.squeeze(1)  # [B, 16, lat_h, lat_w]
+
+                # y = concat(mask, image_latent_with_zeros)
+                # The image latent should be repeated/padded to match 21 frames
+                # Actually, looking at image2video.py, y is [4+16, 21, H, W] = [20, 21, H, W]
+                # mask is [4, 21, H, W] and image_latent_padded is [16, 21, H, W]
+
+                # Create padded image latent (first frame is encoded, rest is zeros)
+                image_latent_padded = torch.zeros(
+                    batch_size, 16, 21, lat_h, lat_w,
+                    device=self.device, dtype=self.dtype
+                )
+                # The first temporal position gets the image latent
+                image_latent_padded[:, :, 0, :, :] = image_latent_expanded
+
+                # y = concat along channel dim: [B, 4+16, 21, H, W] = [B, 20, 21, H, W]
+                y = torch.cat([msk, image_latent_padded], dim=1)
+                # Convert to list format expected by I2V model
+                y = [y_i for y_i in y]
 
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
@@ -240,6 +303,21 @@ class Trainer:
             else:
                 unconditional_dict = self.unconditional_dict
 
+            # Build I2V conditional dicts if in I2V mode
+            # For I2V, real_score needs clip_fea and y in addition to prompt_embeds
+            # For CFG, both cond and uncond use same clip_fea and y, only text differs
+            if self.config.i2v:
+                conditional_dict_i2v = {
+                    "prompt_embeds": conditional_dict["prompt_embeds"],
+                    "clip_fea": clip_fea,
+                    "y": y
+                }
+                unconditional_dict_i2v = {
+                    "prompt_embeds": unconditional_dict["prompt_embeds"],
+                    "clip_fea": clip_fea,  # Same clip_fea for unconditional
+                    "y": y  # Same y for unconditional
+                }
+
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
             generator_loss, generator_log_dict = self.model.generator_loss(
@@ -247,7 +325,9 @@ class Trainer:
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 clean_latent=clean_latent,
-                initial_latent=image_latent if self.config.i2v else None
+                initial_latent=image_latent if self.config.i2v else None,
+                conditional_dict_i2v=conditional_dict_i2v,
+                unconditional_dict_i2v=unconditional_dict_i2v
             )
 
             generator_loss.backward()
@@ -262,6 +342,7 @@ class Trainer:
             generator_log_dict = {}
 
         # Step 4: Store gradients for the critic (if training the critic)
+        # Note: critic_loss always uses T2V model which doesn't need I2V conditioning
         critic_loss, critic_log_dict = self.model.critic_loss(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,

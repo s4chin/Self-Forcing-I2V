@@ -56,6 +56,8 @@ class DMD(SelfForcingModel):
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
         conditional_dict: dict, unconditional_dict: dict,
+        conditional_dict_i2v: Optional[dict] = None,
+        unconditional_dict_i2v: Optional[dict] = None,
         normalization: bool = True
     ) -> Tuple[torch.Tensor, dict]:
         """
@@ -64,14 +66,16 @@ class DMD(SelfForcingModel):
             - noisy_image_or_video: a tensor with shape [B, F, C, H, W] where the number of frame is 1 for images.
             - estimated_clean_image_or_video: a tensor with shape [B, F, C, H, W] representing the estimated clean image or video.
             - timestep: a tensor with shape [B, F] containing the randomly generated timestep.
-            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
-            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
+            - conditional_dict: a dictionary containing the conditional information for T2V (e.g. text embeddings).
+            - unconditional_dict: a dictionary containing the unconditional information for T2V.
+            - conditional_dict_i2v: (optional) a dictionary containing I2V-specific conditioning (clip_fea, y).
+            - unconditional_dict_i2v: (optional) a dictionary containing I2V-specific unconditional info.
             - normalization: a boolean indicating whether to normalize the gradient.
         Output:
             - kl_grad: a tensor representing the KL grad.
             - kl_log_dict: a dictionary containing the intermediate tensors for logging.
         """
-        # Step 1: Compute the fake score
+        # Step 1: Compute the fake score (T2V model - uses text only)
         _, pred_fake_image_cond = self.fake_score(
             noisy_image_or_video=noisy_image_or_video,
             conditional_dict=conditional_dict,
@@ -91,17 +95,22 @@ class DMD(SelfForcingModel):
             pred_fake_image = pred_fake_image_cond
 
         # Step 2: Compute the real score
+        # For I2V mode, use I2V-specific conditioning (clip_fea, y) for real_score
+        # For CFG, both cond and uncond use the same clip_fea and y, only text differs
+        real_cond_dict = conditional_dict_i2v if conditional_dict_i2v is not None else conditional_dict
+        real_uncond_dict = unconditional_dict_i2v if unconditional_dict_i2v is not None else unconditional_dict
+
         # We compute the conditional and unconditional prediction
         # and add them together to achieve cfg (https://arxiv.org/abs/2207.12598)
         _, pred_real_image_cond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=conditional_dict,
+            conditional_dict=real_cond_dict,
             timestep=timestep
         )
 
         _, pred_real_image_uncond = self.real_score(
             noisy_image_or_video=noisy_image_or_video,
-            conditional_dict=unconditional_dict,
+            conditional_dict=real_uncond_dict,
             timestep=timestep
         )
 
@@ -130,6 +139,8 @@ class DMD(SelfForcingModel):
         image_or_video: torch.Tensor,
         conditional_dict: dict,
         unconditional_dict: dict,
+        conditional_dict_i2v: Optional[dict] = None,
+        unconditional_dict_i2v: Optional[dict] = None,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
         denoised_timestep_to: int = 0
@@ -138,9 +149,11 @@ class DMD(SelfForcingModel):
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
         Input:
             - image_or_video: a tensor with shape [B, F, C, H, W] where the number of frame is 1 for images.
-            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
-            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
-            - gradient_mask: a boolean tensor with the same shape as image_or_video indicating which pixels to compute loss .
+            - conditional_dict: a dictionary containing the conditional information for T2V.
+            - unconditional_dict: a dictionary containing the unconditional information for T2V.
+            - conditional_dict_i2v: (optional) I2V-specific conditioning (clip_fea, y) for real_score.
+            - unconditional_dict_i2v: (optional) I2V-specific unconditional info for real_score.
+            - gradient_mask: a boolean tensor with the same shape as image_or_video indicating which pixels to compute loss.
         Output:
             - dmd_loss: a scalar tensor representing the DMD loss.
             - dmd_log_dict: a dictionary containing the intermediate tensors for logging.
@@ -182,7 +195,9 @@ class DMD(SelfForcingModel):
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
                 conditional_dict=conditional_dict,
-                unconditional_dict=unconditional_dict
+                unconditional_dict=unconditional_dict,
+                conditional_dict_i2v=conditional_dict_i2v,
+                unconditional_dict_i2v=unconditional_dict_i2v
             )
 
         if gradient_mask is not None:
@@ -199,7 +214,9 @@ class DMD(SelfForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        conditional_dict_i2v: Optional[dict] = None,
+        unconditional_dict_i2v: Optional[dict] = None
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -208,9 +225,12 @@ class DMD(SelfForcingModel):
         See Sec 4.5 of the DMD2 paper (https://arxiv.org/abs/2405.14867) for details.
         Input:
             - image_or_video_shape: a list containing the shape of the image or video [B, F, C, H, W].
-            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
-            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
+            - conditional_dict: a dictionary containing the conditional information for T2V.
+            - unconditional_dict: a dictionary containing the unconditional information for T2V.
             - clean_latent: a tensor containing the clean latents [B, F, C, H, W]. Need to be passed when no backward simulation is used.
+            - initial_latent: a tensor containing the initial latent (first frame) for I2V.
+            - conditional_dict_i2v: (optional) I2V-specific conditioning (clip_fea, y) for real_score.
+            - unconditional_dict_i2v: (optional) I2V-specific unconditional info for real_score.
         Output:
             - loss: a scalar tensor representing the generator loss.
             - generator_log_dict: a dictionary containing the intermediate tensors for logging.
@@ -227,6 +247,8 @@ class DMD(SelfForcingModel):
             image_or_video=pred_image,
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
+            conditional_dict_i2v=conditional_dict_i2v,
+            unconditional_dict_i2v=unconditional_dict_i2v,
             gradient_mask=gradient_mask,
             denoised_timestep_from=denoised_timestep_from,
             denoised_timestep_to=denoised_timestep_to
