@@ -4,7 +4,7 @@
 # generator: T2V causal model (uses text + initial_latent as first frame)
 
 i2v: true
-real_name: Wan2.1-I2V-14B
+real_name: Wan2.1-I2V-14B-480P
 fake_name: Wan2.1-T2V-1.3B
 independent_first_frame: true
 
@@ -22,7 +22,7 @@ denoising_step_list:
 warp_denoising_step: true # need to remove - 0 in denoising_step_list if warp_denoising_step is true
 ts_schedule: false
 num_train_timestep: 1000
-timestep_shift: 5.0
+timestep_shift: 5.0 ## TODO, i remember it was 3.0 for this model
 guidance_scale: 3.0
 denoising_loss_type: flow
 mixed_precision: true
@@ -55,7 +55,7 @@ image_or_video_shape:
 distribution_loss: dmd
 trainer: score_distillation
 gradient_checkpointing: true
-num_frame_per_block: 3 ## TODO
+num_frame_per_block: 1 ## TODO
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0 ## TODO

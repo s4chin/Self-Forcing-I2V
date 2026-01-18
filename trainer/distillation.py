@@ -99,11 +99,10 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        # FSDP wrap clip_encoder for I2V
         if getattr(config, "i2v", False) and self.model.clip_encoder is not None:
             self.model.clip_encoder = fsdp_wrap(
                 self.model.clip_encoder,
-                sharding_strategy=config.sharding_strategy,
+                sharding_strategy="no_shard",
                 mixed_precision=config.mixed_precision,
                 wrap_strategy=getattr(config, "clip_encoder_fsdp_wrap_strategy", "size")
             )

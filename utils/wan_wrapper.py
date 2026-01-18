@@ -318,11 +318,13 @@ class WanCLIPEncoder(torch.nn.Module):
     """
     def __init__(
         self,
-        checkpoint_path: str = "wan_models/Wan2.1-I2V-14B/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth",
+        model_name: str = "Wan2.1-I2V-14B",
         dtype: torch.dtype = torch.float16
     ):
         super().__init__()
         from wan.modules.clip import CLIPModel
+
+        checkpoint_path = f"wan_models/{model_name}/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
         
         self.dtype = dtype
         self.clip = CLIPModel(
@@ -330,11 +332,11 @@ class WanCLIPEncoder(torch.nn.Module):
             device=torch.device('cpu'),  # Will be moved to GPU later via FSDP
             checkpoint_path=checkpoint_path,
         )
-        self.clip.model.eval().requires_grad_(False)
+        self.clip.eval().requires_grad_(False)
 
     @property
     def device(self):
-        return next(self.clip.model.parameters()).device
+        return next(self.clip.parameters()).device
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -352,11 +354,18 @@ class WanCLIPEncoder(torch.nn.Module):
         images = images.to(device=self.device, dtype=self.dtype)
         videos = [img.unsqueeze(1) for img in images]  # List of [C, 1, H, W]
         
-        with torch.cuda.amp.autocast(dtype=self.dtype):
-            clip_fea = self.clip.visual(videos)
+        clip_fea = self.clip.visual(videos)
         
         return clip_fea
 
+
+def dbg_print(x):
+    if isinstance(x, torch.Tensor):
+        print(f"{x.shape=}")
+    elif isinstance(x, list):
+        print(f"{len(x)=}, {[y.shape for y in x]}")
+    else:
+        print(f"{x=}")
 
 class WanI2VDiffusionWrapper(WanDiffusionWrapper):
     """
@@ -420,7 +429,11 @@ class WanI2VDiffusionWrapper(WanDiffusionWrapper):
 
         # I2V model call with clip_fea and y
         # Following wan/image2video.py lines 305-306
-        print(f"Inside I2VDiffusionWrapper forward: {noisy_image_or_video.shape=}, {input_timestep.shape=}, {prompt_embeds.shape=}, {clip_fea.shape=}, {y.shape=}")
+        dbg_print(noisy_image_or_video)
+        dbg_print(input_timestep)
+        dbg_print(prompt_embeds)
+        dbg_print(clip_fea)
+        dbg_print(y)
         flow_pred = self.model(
             [noisy_image_or_video.permute(0, 2, 1, 3, 4)],  # List of [C, F, H, W]
             t=input_timestep,

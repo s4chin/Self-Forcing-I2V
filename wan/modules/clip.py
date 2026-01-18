@@ -47,7 +47,13 @@ class QuickGELU(nn.Module):
 class LayerNorm(nn.LayerNorm):
 
     def forward(self, x):
-        return super().forward(x.float()).type_as(x)
+        return F.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            self.weight.float() if self.weight is not None else None,
+            self.bias.float() if self.bias is not None else None,
+            self.eps
+        ).type_as(x)
 
 
 class SelfAttention(nn.Module):
@@ -401,7 +407,7 @@ class XLMRobertaCLIP(nn.Module):
             num_layers=text_layers,
             post_norm=text_post_norm,
             dropout=text_dropout)
-        self.log_scale = nn.Parameter(math.log(1 / 0.07) * torch.ones([]))
+        self.log_scale = nn.Parameter(math.log(1 / 0.07) * torch.ones(1))
 
     def forward(self, imgs, txt_ids):
         """
@@ -498,11 +504,11 @@ def clip_xlm_roberta_vit_h_14(
     return _clip(pretrained, pretrained_name, XLMRobertaCLIP, **cfg)
 
 
-class CLIPModel:
+class CLIPModel(nn.Module):
 
     def __init__(self, dtype, device, checkpoint_path, tokenizer_path = None):
+        super().__init__()
         self.dtype = dtype
-        self.device = device
         self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
 
@@ -515,8 +521,10 @@ class CLIPModel:
             device=device)
         self.model = self.model.eval().requires_grad_(False)
         logging.info(f'loading {checkpoint_path}')
-        self.model.load_state_dict(
-            torch.load(checkpoint_path, map_location='cpu'))
+        state_dict = torch.load(checkpoint_path, map_location='cpu')
+        if 'log_scale' in state_dict and state_dict['log_scale'].dim() == 0:
+            state_dict['log_scale'] = state_dict['log_scale'].unsqueeze(0)
+        self.model.load_state_dict(state_dict)
 
         # init tokenizer
         if tokenizer_path is not None:
@@ -540,6 +548,6 @@ class CLIPModel:
         videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
 
         # forward
-        with torch.cuda.amp.autocast(dtype=self.dtype):
+        with torch.amp.autocast('cuda', dtype=self.dtype):
             out = self.model.visual(videos, use_31_block=True)
             return out

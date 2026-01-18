@@ -35,7 +35,7 @@ class BaseModel(nn.Module):
         # Real score: I2V model if i2v=True, else T2V
         if self.is_i2v:
             self.real_score = WanI2VDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
-            self.clip_encoder = WanCLIPEncoder()
+            self.clip_encoder = WanCLIPEncoder(model_name=self.real_model_name)
             self.clip_encoder.requires_grad_(False)
         else:
             self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
