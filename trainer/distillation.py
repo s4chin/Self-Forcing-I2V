@@ -281,8 +281,7 @@ class Trainer:
 
                 # y = concat along channel dim: [B, 4+16, 21, H, W] = [B, 20, 21, H, W]
                 y = torch.cat([msk, image_latent_padded], dim=1)
-                # Convert to list format expected by I2V model
-                y = [y_i for y_i in y]
+                y = [y_i.unsqueeze(0) for y_i in y]
 
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
