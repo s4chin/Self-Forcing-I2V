@@ -429,19 +429,14 @@ class WanI2VDiffusionWrapper(WanDiffusionWrapper):
 
         # I2V model call with clip_fea and y
         # Following wan/image2video.py lines 305-306
-        dbg_print(noisy_image_or_video)
-        dbg_print(input_timestep)
-        dbg_print(prompt_embeds)
-        dbg_print(clip_fea)
-        dbg_print(y)
         flow_pred = self.model(
-            [noisy_image_or_video.permute(0, 2, 1, 3, 4)],  # List of [C, F, H, W]
+            noisy_image_or_video.permute(0, 2, 1, 3, 4),  # [B, C, F, H, W]
             t=input_timestep,
-            context=[prompt_embeds],
+            context=prompt_embeds,
             clip_fea=clip_fea,
             y=y,
             seq_len=self.seq_len
-        )[0].permute(0, 2, 1, 3, 4)  # Back to [B, F, C, H, W]
+        ).permute(0, 2, 1, 3, 4)  # Back to [B, F, C, H, W]
 
         pred_x0 = self._convert_flow_pred_to_x0(
             flow_pred=flow_pred.flatten(0, 1),

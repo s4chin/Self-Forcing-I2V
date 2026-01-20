@@ -237,51 +237,21 @@ class Trainer:
                 # image needs to be [B, C, T, H, W] for VAE
                 image_for_vae = rearrange(raw_image, "b c h w -> b c 1 h w")
                 image_latent = self.model.vae.encode_to_latent(image_for_vae)  # [B, 1, C, H, W]
-                print(f"{image_latent.shape=}")
+                lb, lf, lc, lh, lw = list(self.config.image_or_video_shape)
 
                 # CLIP encode image to get clip_fea
                 clip_fea = self.model.clip_encoder(raw_image)
-                print(f"{clip_fea.shape=}")
 
                 # Create mask tensor for I2V conditioning
                 # Following wan/image2video.py lines 207-214
-                lat_h, lat_w = image_latent.shape[-2], image_latent.shape[-1]
-                batch_size = raw_image.shape[0]
+                msk = torch.ones(lb, 4, lf, lh, lw, device=self.device, dtype=self.dtype)
+                msk[:, :, 1:, :, :] = 0
 
-                # Mask: 1 for first frame, 0 for rest (81 frames total)
-                msk = torch.ones(batch_size, 81, lat_h, lat_w, device=self.device, dtype=self.dtype)
-                msk[:, 1:] = 0
-                # Reshape: repeat first frame 4 times, then rest
-                msk = torch.concat([
-                    torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1),
-                    msk[:, 1:]
-                ], dim=1)
-                # Reshape to [B, 4, 21, lat_h, lat_w]
-                msk = msk.view(batch_size, msk.shape[1] // 4, 4, lat_h, lat_w)
-                msk = msk.transpose(1, 2)  # [B, 4, 21, lat_h, lat_w]
-
-                # Create y by concatenating mask and image latent
-                # image_latent is [B, 1, 16, lat_h, lat_w], need to expand to full video
-                # Following wan/image2video.py lines 237-246
-                # First, encode the image and add zeros for remaining frames
-                image_latent_expanded = image_latent.squeeze(1)  # [B, 16, lat_h, lat_w]
-
-                # y = concat(mask, image_latent_with_zeros)
-                # The image latent should be repeated/padded to match 21 frames
-                # Actually, looking at image2video.py, y is [4+16, 21, H, W] = [20, 21, H, W]
-                # mask is [4, 21, H, W] and image_latent_padded is [16, 21, H, W]
-
-                # Create padded image latent (first frame is encoded, rest is zeros)
-                image_latent_padded = torch.zeros(
-                    batch_size, 16, 21, lat_h, lat_w,
-                    device=self.device, dtype=self.dtype
-                )
-                # The first temporal position gets the image latent
-                image_latent_padded[:, :, 0, :, :] = image_latent_expanded
+                image_latent_padded = torch.zeros(lb, lc, lf, lh, lw, device=self.device, dtype=self.dtype)
+                image_latent_padded[:, :, 0, :, :] = image_latent
 
                 # y = concat along channel dim: [B, 4+16, 21, H, W] = [B, 20, 21, H, W]
                 y = torch.cat([msk, image_latent_padded], dim=1)
-                y = [y_i.unsqueeze(0) for y_i in y]
 
         batch_size = len(text_prompts)
         image_or_video_shape = list(self.config.image_or_video_shape)
