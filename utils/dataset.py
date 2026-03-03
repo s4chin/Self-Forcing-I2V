@@ -217,59 +217,74 @@ class TextImagePairDataset(Dataset):
 class I2VDataset(Dataset):
     """
     Dataset for Image-to-Video training.
-    Returns text prompts and raw images (normalized to [-1, 1]).
-    
-    Currently returns dummy data as placeholder - actual data loading
-    will be implemented later.
+    Expects directory layout:
+        data_path/{split}/*.csv       (CSV with columns: video_path, image_path, prompt, ood)
+        data_path/{split}/<images>/   (images referenced by image_path column)
+    Image paths in the CSV are resolved relative to the split directory.
+    Returns text prompts and conditioning images normalized to [-1, 1].
     """
     def __init__(
         self,
         data_path: str,
-        image_size: tuple = (480, 832),  # H, W - matches 60x104 latent at 8x downsample
-        num_samples: int = 10000,
+        split: str = "train",
+        image_size: tuple = (480, 832),
     ):
         """
         Args:
-            data_path: Path to dataset (unused for dummy data)
-            image_size: Target image size (H, W)
-            num_samples: Number of dummy samples to generate
+            data_path: Root dataset directory containing split subdirectories (train/val/test).
+            split: Which split to load.
+            image_size: Target image size as (H, W).
         """
-        self.data_path = data_path
+        import csv
+        import glob
+
         self.image_size = image_size
-        self.num_samples = num_samples
-        
-        # Dummy prompts for testing
-        self.dummy_prompts = [
-            "A beautiful sunset over the ocean with waves crashing on the shore.",
-            "A cat playing with a ball of yarn in a cozy living room.",
-            "A drone flying over a mountain landscape with snow-capped peaks.",
-            "A chef cooking in a professional kitchen with flames rising.",
-            "A dancer performing ballet on stage with dramatic lighting.",
-        ]
+        self.split_dir = Path(data_path) / split
+        if not self.split_dir.is_dir():
+            raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
+
+        csv_files = sorted(glob.glob(str(self.split_dir / "*.csv")))
+        if not csv_files:
+            raise FileNotFoundError(f"No CSV files found in {self.split_dir}")
+
+        self.samples = []
+        for csv_path in csv_files:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    self.samples.append({
+                        "image_path": row["image_path"].strip(),
+                        "prompt": row["prompt"].strip(),
+                    })
 
     def __len__(self):
-        return self.num_samples
+        return len(self.samples)
 
     def __getitem__(self, idx):
         """
         Returns:
-            dict: A dictionary containing:
-                - prompts: str - text prompt
-                - image: torch.Tensor - [C, H, W] normalized to [-1, 1]
+            dict with keys:
+                - prompts: str
+                - image: torch.Tensor [C, H, W] normalized to [-1, 1]
+                - idx: int
         """
-        # Generate dummy prompt (cycle through available prompts)
-        prompt = self.dummy_prompts[idx % len(self.dummy_prompts)]
-        
-        # Generate dummy image (random noise for now)
-        # In real implementation, this would load actual images
-        # Image is [C, H, W] normalized to [-1, 1]
-        image = torch.randn(3, self.image_size[0], self.image_size[1])
-        image = image.clamp(-1, 1)  # Clamp to valid range
-        
+        sample = self.samples[idx]
+
+        image_path = self.split_dir / sample["image_path"]
+        image = Image.open(image_path).convert("RGB")
+        image = image.resize(
+            (self.image_size[1], self.image_size[0]),
+            Image.LANCZOS,
+        )
+
+        image = torch.tensor(
+            np.array(image), dtype=torch.float32
+        ).permute(2, 0, 1) / 127.5 - 1.0
+
         return {
-            "prompts": prompt,
+            "prompts": sample["prompt"],
             "image": image,
-            "idx": idx
+            "idx": idx,
         }
 
 
