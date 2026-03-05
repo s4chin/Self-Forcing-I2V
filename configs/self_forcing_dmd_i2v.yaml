@@ -40,6 +40,7 @@ beta1_critic: 0.0
 beta2_critic: 0.999
 data_path: data/i2v_training  # Path to I2V dataset
 batch_size: 1
+num_workers: 2  # Reduced from 8 to avoid OOM when forking (64 procs × 8 workers = 512 forks)
 ema_weight: 0.99
 ema_start_step: 200
 total_batch_size: 64
