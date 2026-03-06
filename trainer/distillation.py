@@ -142,11 +142,12 @@ class Trainer:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
+        num_workers = getattr(config, "num_workers", 8)
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=num_workers)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
