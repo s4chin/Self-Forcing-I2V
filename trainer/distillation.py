@@ -147,7 +147,9 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=num_workers)
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+            multiprocessing_context='spawn' if num_workers > 0 else None)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
