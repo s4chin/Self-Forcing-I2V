@@ -449,6 +449,13 @@ class Trainer:
                     }
                 )
 
+                current_time = time.time()
+                if self.previous_time is not None:
+                    iter_time = current_time - self.previous_time
+                    wandb_loss_dict["iter_time"] = iter_time
+                loss_str = " | ".join(f"{k}: {v:.4f}" for k, v in wandb_loss_dict.items())
+                print(f"[Step {self.step}] {loss_str}", flush=True)
+
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
 
@@ -459,10 +466,4 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             if self.is_main_process:
-                current_time = time.time()
-                if self.previous_time is None:
-                    self.previous_time = current_time
-                else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
-                    self.previous_time = current_time
+                self.previous_time = current_time
