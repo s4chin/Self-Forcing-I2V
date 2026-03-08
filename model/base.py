@@ -54,6 +54,11 @@ class BaseModel(nn.Module):
         self.scheduler = self.generator.get_scheduler()
         self.scheduler.timesteps = self.scheduler.timesteps.to(device)
 
+        # Sync score model schedulers with the generator's scheduler so that
+        # _convert_flow_pred_to_x0 uses the same sigma that add_noise used.
+        self.real_score.scheduler = self.scheduler
+        self.fake_score.scheduler = self.scheduler
+
     def _get_timestep(
             self,
             min_timestep: int,

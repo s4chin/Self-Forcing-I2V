@@ -88,6 +88,13 @@ def launch_distributed_job(backend: str = "nccl"):
     torch.cuda.set_device(local_rank)
 
 
+def _clean_fsdp_key(name: str) -> str:
+    return (name
+            .replace("_fsdp_wrapped_module.", "")
+            .replace("_checkpoint_wrapped_module.", "")
+            .replace("_orig_mod.", ""))
+
+
 class EMA_FSDP:
     def __init__(self, fsdp_module: torch.nn.Module, decay: float = 0.999):
         self.decay = decay
@@ -99,7 +106,7 @@ class EMA_FSDP:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         with FSDP.summon_full_params(fsdp_module, writeback=False):
             for n, p in fsdp_module.module.named_parameters():
-                self.shadow[n] = p.detach().clone().float().cpu()
+                self.shadow[_clean_fsdp_key(n)] = p.detach().clone().float().cpu()
 
     @torch.no_grad()
     def update(self, fsdp_module):
@@ -107,7 +114,7 @@ class EMA_FSDP:
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         with FSDP.summon_full_params(fsdp_module, writeback=False):
             for n, p in fsdp_module.module.named_parameters():
-                self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
+                self.shadow[_clean_fsdp_key(n)].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
 
     # Optional helpers ---------------------------------------------------
     def state_dict(self):
@@ -117,9 +124,9 @@ class EMA_FSDP:
         self.shadow = {k: v.clone() for k, v in sd.items()}
 
     def copy_to(self, fsdp_module):
-        # load EMA weights into an (unwrapped) copy of the generator
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         with FSDP.summon_full_params(fsdp_module, writeback=True):
             for n, p in fsdp_module.module.named_parameters():
-                if n in self.shadow:
-                    p.data.copy_(self.shadow[n].to(p.dtype, device=p.device))
+                clean = _clean_fsdp_key(n)
+                if clean in self.shadow:
+                    p.data.copy_(self.shadow[clean].to(p.dtype, device=p.device))

@@ -1,5 +1,6 @@
 import gc
 import logging
+import numpy as np
 
 from utils.dataset import cycle, I2VDataset, TextDataset
 from einops import rearrange
@@ -155,6 +156,18 @@ class Trainer:
             print("DATASET SIZE %d" % len(dataset))
         self.dataloader = cycle(dataloader)
 
+        # Step 4: Set up visualization
+        self.vis_pipeline = None
+        if not config.no_visualize:
+            vis_sample = dataset[0]
+            self.vis_prompt = vis_sample["prompts"]
+            self.vis_image = vis_sample.get("image", None)
+            with torch.no_grad():
+                vis_cond = self.model.text_encoder(text_prompts=[self.vis_prompt])
+                self.vis_conditional_dict = {k: v.detach().clone() for k, v in vis_cond.items()}
+            if self.is_main_process:
+                print(f"Visualization prompt: {self.vis_prompt[:80]}...")
+
         ##############################################################################################################
         # 6. Set up EMA parameter containers
         rename_param = (
@@ -233,6 +246,8 @@ class Trainer:
                        f"checkpoint_model_{self.step:06d}", "model.pt"))
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
+
+        return generator_state_dict
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -373,6 +388,72 @@ class Trainer:
         current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
         return current_video
 
+    def _init_vis_pipeline(self):
+        """Create a lightweight inference pipeline for visualization (rank 0 only)."""
+        from pipeline.causal_inference import CausalInferencePipeline
+        from utils.wan_wrapper import WanDiffusionWrapper
+
+        class _CachedTextEncoder(torch.nn.Module):
+            def __init__(self, cached_dict):
+                super().__init__()
+                self._cached = cached_dict
+            def forward(self, text_prompts=None):
+                return self._cached
+
+        vis_generator = WanDiffusionWrapper(
+            **getattr(self.config, "model_kwargs", {}), is_causal=True)
+        vis_generator = vis_generator.cpu()
+
+        self.vis_pipeline = CausalInferencePipeline(
+            self.config,
+            device=self.device,
+            generator=vis_generator,
+            text_encoder=_CachedTextEncoder(self.vis_conditional_dict),
+            vae=self.model.vae
+        )
+
+    @torch.no_grad()
+    def _visualize(self, generator_state_dict):
+        """Generate a video with the current generator weights and log it."""
+        if not self.is_main_process:
+            return
+        try:
+            if self.vis_pipeline is None:
+                self._init_vis_pipeline()
+
+            self.vis_pipeline.generator.load_state_dict(generator_state_dict)
+            self.vis_pipeline.generator = self.vis_pipeline.generator.to(
+                device=self.device, dtype=self.dtype)
+
+            video = self.generate_video(
+                self.vis_pipeline,
+                [self.vis_prompt],
+                self.vis_image
+            )
+
+            self.vis_pipeline.generator = self.vis_pipeline.generator.cpu()
+            torch.cuda.empty_cache()
+
+            video_uint8 = video[0].clip(0, 255).astype(np.uint8)
+
+            vis_dir = os.path.join(self.output_path, "vis")
+            os.makedirs(vis_dir, exist_ok=True)
+            video_path = os.path.join(vis_dir, f"step_{self.step:06d}.mp4")
+            from torchvision.io import write_video
+            write_video(video_path, torch.from_numpy(video_uint8), fps=16)
+            print(f"[Vis] Saved video to {video_path}")
+
+            if not self.disable_wandb:
+                wandb.log({
+                    "generated_video": wandb.Video(
+                        video_uint8, caption=self.vis_prompt[:100], fps=16, format="mp4")
+                }, step=self.step)
+
+        except Exception as e:
+            print(f"[Warning] Visualization failed at step {self.step}: {e}")
+            import traceback
+            traceback.print_exc()
+
     def train(self):
         start_step = self.step
 
@@ -424,11 +505,16 @@ class Trainer:
                     (self.generator_ema is None) and (self.config.ema_weight > 0):
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
 
-            # Save the model
+            # Save the model and visualize
             if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
                 torch.cuda.empty_cache()
-                self.save()
+                generator_state_dict = self.save()
                 torch.cuda.empty_cache()
+
+                if not self.config.no_visualize:
+                    self._visualize(generator_state_dict)
+                    del generator_state_dict
+                    torch.cuda.empty_cache()
 
             # Logging
             if self.is_main_process:

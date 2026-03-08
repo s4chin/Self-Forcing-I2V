@@ -15,6 +15,9 @@ from pipeline import (
     CausalInferencePipeline,
 )
 from utils.dataset import TextDataset, TextImagePairDataset
+import csv
+from pathlib import Path
+from PIL import Image
 from utils.misc import set_seed
 
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
@@ -87,7 +90,35 @@ if args.i2v:
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5])
     ])
-    dataset = TextImagePairDataset(args.data_path, transform=transform)
+    if args.data_path.endswith('.csv'):
+        csv_path = Path(args.data_path)
+        base_dir = csv_path.parent
+        samples = []
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                img_col = 'input_image' if 'input_image' in row else 'image_path'
+                samples.append({
+                    'image_path': str(base_dir / row[img_col].strip()),
+                    'prompt': row['prompt'].strip(),
+                })
+
+        class _CSVImageDataset(torch.utils.data.Dataset):
+            def __init__(self, samples, transform):
+                self.samples = samples
+                self.transform = transform
+            def __len__(self):
+                return len(self.samples)
+            def __getitem__(self, idx):
+                s = self.samples[idx]
+                image = Image.open(s['image_path']).convert('RGB')
+                if self.transform:
+                    image = self.transform(image)
+                return {'image': image, 'prompts': s['prompt'], 'idx': idx}
+
+        dataset = _CSVImageDataset(samples, transform)
+    else:
+        dataset = TextImagePairDataset(args.data_path, transform=transform)
 else:
     dataset = TextDataset(prompt_path=args.data_path, extended_prompt_path=args.extended_prompt_path)
 num_prompts = len(dataset)

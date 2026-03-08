@@ -59,4 +59,4 @@ gradient_checkpointing: true
 num_frame_per_block: 1 ## TODO
 load_raw_video: false
 model_kwargs:
-  timestep_shift: 3.0 ## i2v 480p has shift = 3.0 in wan 2.1 repo
+  timestep_shift: 5.0 ## should match ode_init's training shift; i2v teacher shift (3.0) doesn't go here
