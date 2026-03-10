@@ -322,6 +322,7 @@ class Trainer:
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
+            return_predictions = (self.step % self.config.log_iters == 0) and self.is_main_process
             generator_loss, generator_log_dict = self.model.generator_loss(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
@@ -329,7 +330,8 @@ class Trainer:
                 clean_latent=clean_latent,
                 initial_latent=image_latent if self.config.i2v else None,
                 conditional_dict_i2v=conditional_dict_i2v,
-                unconditional_dict_i2v=unconditional_dict_i2v
+                unconditional_dict_i2v=unconditional_dict_i2v,
+                return_predictions=return_predictions,
             )
 
             scaled_generator_loss = generator_loss / self.grad_accumulation_steps
@@ -413,6 +415,39 @@ class Trainer:
         )
 
     @torch.no_grad()
+    def _decode_diagnostics(self, log_dict):
+        """Decode teacher/critic/generator x0 predictions and save as images for diagnosis."""
+        if not self.is_main_process:
+            return
+        keys = [("_pred_real", "teacher"), ("_pred_fake", "critic"), ("_generator_output", "generator")]
+        diag_dir = os.path.join(self.output_path, "diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+        try:
+            for key, label in keys:
+                if key not in log_dict:
+                    continue
+                latent = log_dict[key][:1]  # first sample only: [1, F, C, H, W]
+                frame_indices = [0, latent.shape[1] // 2, latent.shape[1] - 1]
+                pixels = self.model.vae.decode_to_pixel(
+                    latent.to(device=self.device, dtype=self.dtype))  # [1, F, C_rgb, H_px, W_px]
+                for fi in frame_indices:
+                    frame = pixels[0, fi]  # [C, H, W]
+                    frame = frame.clamp(-1, 1).mul(0.5).add(0.5).mul(255).byte()
+                    frame = frame.permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+                    from PIL import Image
+                    img = Image.fromarray(frame)
+                    img.save(os.path.join(diag_dir, f"step{self.step:06d}_{label}_f{fi}.png"))
+                    if not self.disable_wandb:
+                        wandb.log({
+                            f"diag/{label}_f{fi}": wandb.Image(img)
+                        }, step=self.step)
+            print(f"[Diag] Saved diagnostic frames to {diag_dir}")
+        except Exception as e:
+            print(f"[Warning] Diagnostic decode failed at step {self.step}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    @torch.no_grad()
     def _visualize(self, generator_state_dict):
         """Generate a video with the current generator weights and log it."""
         if not self.is_main_process:
@@ -480,6 +515,9 @@ class Trainer:
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
 
+                if self.is_main_process and self.step % self.config.log_iters == 0:
+                    self._decode_diagnostics(generator_log_dict)
+
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
@@ -524,9 +562,12 @@ class Trainer:
                         {
                             "generator_loss": generator_log_dict["generator_loss"].mean().item(),
                             "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
-                            "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
+                            "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item(),
                         }
                     )
+                    for diag_key in ("raw_grad_norm", "grad_normalizer", "pred_real_mean", "pred_fake_mean"):
+                        if diag_key in generator_log_dict:
+                            wandb_loss_dict[diag_key] = generator_log_dict[diag_key].mean().item()
 
                 wandb_loss_dict.update(
                     {

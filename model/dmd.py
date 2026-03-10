@@ -45,6 +45,7 @@ class DMD(SelfForcingModel):
         self.ts_schedule = getattr(args, "ts_schedule", True)
         self.ts_schedule_max = getattr(args, "ts_schedule_max", False)
         self.min_score_timestep = getattr(args, "min_score_timestep", 0)
+        self.dmd_normalize = getattr(args, "dmd_normalize", True)
 
         if getattr(self.scheduler, "alphas_cumprod", None) is not None:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
@@ -58,7 +59,8 @@ class DMD(SelfForcingModel):
         conditional_dict: dict, unconditional_dict: dict,
         conditional_dict_i2v: Optional[dict] = None,
         unconditional_dict_i2v: Optional[dict] = None,
-        normalization: bool = True
+        normalization: bool = True,
+        return_predictions: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the KL grad (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -121,18 +123,27 @@ class DMD(SelfForcingModel):
         # Step 3: Compute the DMD gradient (DMD paper eq. 7).
         grad = (pred_fake_image - pred_real_image)
 
-        # TODO: Change the normalizer for causal teacher
+        log_dict = {
+            "raw_grad_norm": torch.mean(torch.abs(grad)).detach(),
+            "pred_real_mean": torch.mean(torch.abs(pred_real_image)).detach(),
+            "pred_fake_mean": torch.mean(torch.abs(pred_fake_image)).detach(),
+            "timestep": timestep.detach(),
+        }
+
         if normalization:
-            # Step 4: Gradient normalization (DMD paper eq. 8).
             p_real = (estimated_clean_image_or_video - pred_real_image)
             normalizer = torch.abs(p_real).mean(dim=[1, 2, 3, 4], keepdim=True)
+            log_dict["grad_normalizer"] = normalizer.mean().detach()
             grad = grad / normalizer
         grad = torch.nan_to_num(grad)
 
-        return grad, {
-            "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
-            "timestep": timestep.detach()
-        }
+        log_dict["dmdtrain_gradient_norm"] = torch.mean(torch.abs(grad)).detach()
+
+        if return_predictions:
+            log_dict["_pred_real"] = pred_real_image.detach()
+            log_dict["_pred_fake"] = pred_fake_image.detach()
+
+        return grad, log_dict
 
     def compute_distribution_matching_loss(
         self,
@@ -143,7 +154,8 @@ class DMD(SelfForcingModel):
         unconditional_dict_i2v: Optional[dict] = None,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
-        denoised_timestep_to: int = 0
+        denoised_timestep_to: int = 0,
+        return_predictions: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -189,6 +201,11 @@ class DMD(SelfForcingModel):
                 timestep.flatten(0, 1)
             ).detach().unflatten(0, (batch_size, num_frame))
 
+            # For I2V: keep frame 0 clean in the noisy input so the critic
+            # can condition on the first frame via self-attention (implicit I2V).
+            if self.is_i2v:
+                noisy_latent[:, :1] = image_or_video[:, :1].detach()
+
             # Step 2: Compute the KL grad
             grad, dmd_log_dict = self._compute_kl_grad(
                 noisy_image_or_video=noisy_latent,
@@ -197,8 +214,14 @@ class DMD(SelfForcingModel):
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 conditional_dict_i2v=conditional_dict_i2v,
-                unconditional_dict_i2v=unconditional_dict_i2v
+                unconditional_dict_i2v=unconditional_dict_i2v,
+                normalization=self.dmd_normalize,
+                return_predictions=return_predictions,
             )
+
+            # For I2V: zero out gradient for frame 0 (it's the fixed input image)
+            if self.is_i2v:
+                grad[:, :1] = 0
 
         if gradient_mask is not None:
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
@@ -216,7 +239,8 @@ class DMD(SelfForcingModel):
         clean_latent: torch.Tensor,
         initial_latent: torch.Tensor = None,
         conditional_dict_i2v: Optional[dict] = None,
-        unconditional_dict_i2v: Optional[dict] = None
+        unconditional_dict_i2v: Optional[dict] = None,
+        return_predictions: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -251,8 +275,12 @@ class DMD(SelfForcingModel):
             unconditional_dict_i2v=unconditional_dict_i2v,
             gradient_mask=gradient_mask,
             denoised_timestep_from=denoised_timestep_from,
-            denoised_timestep_to=denoised_timestep_to
+            denoised_timestep_to=denoised_timestep_to,
+            return_predictions=return_predictions,
         )
+
+        if return_predictions:
+            dmd_log_dict["_generator_output"] = pred_image.detach()
 
         return dmd_loss, dmd_log_dict
 
@@ -312,6 +340,10 @@ class DMD(SelfForcingModel):
             critic_timestep.flatten(0, 1)
         ).unflatten(0, image_or_video_shape[:2])
 
+        # For I2V: keep frame 0 clean so the critic conditions on it via self-attention
+        if self.is_i2v:
+            noisy_generated_image[:, :1] = generated_image[:, :1]
+
         _, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_generated_image,
             conditional_dict=conditional_dict,
@@ -319,30 +351,45 @@ class DMD(SelfForcingModel):
         )
 
         # Step 3: Compute the denoising loss for the fake critic
+        # For I2V: exclude frame 0 from the loss (it has no noise, so
+        # the flow matching target is meaningless for it)
+        if self.is_i2v:
+            loss_generated = generated_image[:, 1:]
+            loss_pred = pred_fake_image[:, 1:]
+            loss_noise = critic_noise[:, 1:]
+            loss_noisy = noisy_generated_image[:, 1:]
+            loss_ts = critic_timestep[:, 1:]
+        else:
+            loss_generated = generated_image
+            loss_pred = pred_fake_image
+            loss_noise = critic_noise
+            loss_noisy = noisy_generated_image
+            loss_ts = critic_timestep
+
         if self.args.denoising_loss_type == "flow":
             from utils.wan_wrapper import WanDiffusionWrapper
             flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
                 scheduler=self.scheduler,
-                x0_pred=pred_fake_image.flatten(0, 1),
-                xt=noisy_generated_image.flatten(0, 1),
-                timestep=critic_timestep.flatten(0, 1)
+                x0_pred=loss_pred.flatten(0, 1),
+                xt=loss_noisy.flatten(0, 1),
+                timestep=loss_ts.flatten(0, 1)
             )
             pred_fake_noise = None
         else:
             flow_pred = None
             pred_fake_noise = self.scheduler.convert_x0_to_noise(
-                x0=pred_fake_image.flatten(0, 1),
-                xt=noisy_generated_image.flatten(0, 1),
-                timestep=critic_timestep.flatten(0, 1)
-            ).unflatten(0, image_or_video_shape[:2])
+                x0=loss_pred.flatten(0, 1),
+                xt=loss_noisy.flatten(0, 1),
+                timestep=loss_ts.flatten(0, 1)
+            ).unflatten(0, (loss_generated.shape[0], loss_generated.shape[1]))
 
         denoising_loss = self.denoising_loss_func(
-            x=generated_image.flatten(0, 1),
-            x_pred=pred_fake_image.flatten(0, 1),
-            noise=critic_noise.flatten(0, 1),
+            x=loss_generated.flatten(0, 1),
+            x_pred=loss_pred.flatten(0, 1),
+            noise=loss_noise.flatten(0, 1),
             noise_pred=pred_fake_noise,
             alphas_cumprod=self.scheduler.alphas_cumprod,
-            timestep=critic_timestep.flatten(0, 1),
+            timestep=loss_ts.flatten(0, 1),
             flow_pred=flow_pred
         )
 
