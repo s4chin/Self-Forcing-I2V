@@ -61,11 +61,12 @@ class DMD(SelfForcingModel):
         unconditional_dict_i2v: Optional[dict] = None,
         normalization: bool = True,
         return_predictions: bool = False,
+        noisy_image_or_video_critic: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the KL grad (eq 7 in https://arxiv.org/abs/2311.18828).
         Input:
-            - noisy_image_or_video: a tensor with shape [B, F, C, H, W] where the number of frame is 1 for images.
+            - noisy_image_or_video: a tensor with shape [B, F, C, H, W] — noisy input for the teacher.
             - estimated_clean_image_or_video: a tensor with shape [B, F, C, H, W] representing the estimated clean image or video.
             - timestep: a tensor with shape [B, F] containing the randomly generated timestep.
             - conditional_dict: a dictionary containing the conditional information for T2V (e.g. text embeddings).
@@ -73,20 +74,24 @@ class DMD(SelfForcingModel):
             - conditional_dict_i2v: (optional) a dictionary containing I2V-specific conditioning (clip_fea, y).
             - unconditional_dict_i2v: (optional) a dictionary containing I2V-specific unconditional info.
             - normalization: a boolean indicating whether to normalize the gradient.
+            - noisy_image_or_video_critic: (optional) separate noisy input for the critic
+              (e.g. with clean frame 0 for implicit I2V). Falls back to noisy_image_or_video.
         Output:
             - kl_grad: a tensor representing the KL grad.
             - kl_log_dict: a dictionary containing the intermediate tensors for logging.
         """
-        # Step 1: Compute the fake score (T2V model - uses text only)
+        noisy_input_critic = noisy_image_or_video_critic if noisy_image_or_video_critic is not None else noisy_image_or_video
+
+        # Step 1: Compute the fake score (T2V critic — sees clean frame 0 for I2V)
         _, pred_fake_image_cond = self.fake_score(
-            noisy_image_or_video=noisy_image_or_video,
+            noisy_image_or_video=noisy_input_critic,
             conditional_dict=conditional_dict,
             timestep=timestep
         )
 
         if self.fake_guidance_scale != 0.0:
             _, pred_fake_image_uncond = self.fake_score(
-                noisy_image_or_video=noisy_image_or_video,
+                noisy_image_or_video=noisy_input_critic,
                 conditional_dict=unconditional_dict,
                 timestep=timestep
             )
@@ -201,14 +206,20 @@ class DMD(SelfForcingModel):
                 timestep.flatten(0, 1)
             ).detach().unflatten(0, (batch_size, num_frame))
 
-            # For I2V: keep frame 0 clean in the noisy input so the critic
-            # can condition on the first frame via self-attention (implicit I2V).
+            # For I2V: the critic needs clean frame 0 for implicit I2V
+            # conditioning via self-attention, but the teacher must see the
+            # standard all-frames-noisy input (it was trained that way and
+            # already gets image info through y + clip_fea).
             if self.is_i2v:
-                noisy_latent[:, :1] = image_or_video[:, :1].detach()
+                noisy_latent_critic = noisy_latent.clone()
+                noisy_latent_critic[:, :1] = image_or_video[:, :1].detach()
+            else:
+                noisy_latent_critic = noisy_latent
 
             # Step 2: Compute the KL grad
             grad, dmd_log_dict = self._compute_kl_grad(
                 noisy_image_or_video=noisy_latent,
+                noisy_image_or_video_critic=noisy_latent_critic,
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
                 conditional_dict=conditional_dict,
